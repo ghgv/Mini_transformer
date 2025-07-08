@@ -1,6 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import os
+import time
+import json
+import pickle
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=5000):
@@ -85,14 +89,11 @@ class MiniTransformer(nn.Module):
             x = layer(x, mask)
         x = self.ln_f(x)
         logits = self.head(x)
-        print("Embeddings shape:", x.shape)
-        print("Embedding vector for first token:", x[0,0,:])
-        print("Embedding vector for first token:", x[0,1,:])
         return logits
+    
 
-# Ejemplo de entrenamiento mínimo
-if __name__ == "__main__":
-    text = "el gato duerme en la casa"
+def task():
+    text = "El sol sale por el oriente"
     tokens = text.split()
     vocab = {w: i for i, w in enumerate(set(tokens))}
     vocab_size = len(vocab)
@@ -101,25 +102,115 @@ if __name__ == "__main__":
     model = MiniTransformer(vocab_size, d_model=32, num_heads=4, d_ff=128, num_layers=2)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-    for step in range(500):
+    for step in range(200):
         logits = model(indices[:, :-1])
         loss = F.cross_entropy(logits.view(-1, vocab_size), indices[:, 1:].reshape(-1))
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         if step % 50 == 0:
-            print(f"Step {step}, Loss: {loss.item():.4f}")
+            print(f"[{os.getpid()}] Step {step}, Loss: {loss.item():.4f}")
 
-    # Autoregressive generation de 5 tokens
-    generated = indices[:, :1]
+    return model.state_dict(), model, vocab_size, vocab
+
+
+
+def generate_text(model, idx_to_word, vocab, max_tokens=10):
+    model.eval()
+    tokens = list(vocab.keys())
+    indices = torch.tensor([[vocab[tokens[0]]]])  # seed con la primera palabra
+    generated = indices
+
+    with torch.no_grad():
+        for _ in range(max_tokens):
+            logits = model(generated)
+            probs = F.softmax(logits[:, -1, :], dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+            generated = torch.cat([generated, next_token], dim=1)
+
+    text = ' '.join(idx_to_word[idx.item()] for idx in generated[0])
+    return text
+
+# Ejemplo de entrenamiento mínimo
+
+if __name__ == "__main__":
+    r1_fd, w1_fd = os.pipe()  # Padre ➔ Hijo
+    r2_fd, w2_fd = os.pipe()  # Hijo ➔ Padre
+
+    pid = os.fork()
+
+    if pid == 0:
+        # === Hijo ===
+        os.close(w1_fd)
+        os.close(r2_fd)
+
+        state_dict_hijo, model_hijo, vocab_size, vocab_hijo = task()
+
+        # Leer pesos del padre
+        data = b""
+        while True:
+            chunk = os.read(r1_fd, 4096)
+            if not chunk:
+                break
+            data += chunk
+        state_dict_padre = pickle.loads(data)
+
+        # Enviar pesos del hijo al padre
+        data_hijo = pickle.dumps(state_dict_hijo)
+        os.write(w2_fd, data_hijo)
+
+        # Promediar localmente
+        with torch.no_grad():
+            for k in state_dict_hijo.keys():
+                state_dict_hijo[k] = 0.5 * state_dict_hijo[k] + 0.5 * state_dict_padre[k]
+            model_hijo.load_state_dict(state_dict_hijo)
+
+        print(f"[Hijo {os.getpid()}] Promedio completado.")
+
+        os.close(r1_fd)
+        os.close(w2_fd)
+        os._exit(0)
+
+    else:
+        # === Padre ===
+        os.close(r1_fd)
+        os.close(w2_fd)
+
+        state_dict_padre, model_padre, vocab_size, vocab = task()
+        idx_to_word = {i: w for w, i in vocab.items()}
+
+        # Enviar pesos al hijo
+        data_padre = pickle.dumps(state_dict_padre)
+        os.write(w1_fd, data_padre)
+        os.close(w1_fd)
+
+        # Leer pesos del hijo
+        data = b""
+        while True:
+            chunk = os.read(r2_fd, 4096)
+            if not chunk:
+                break
+            data += chunk
+        state_dict_hijo = pickle.loads(data)
+
+        # Promediar localmente
+        with torch.no_grad():
+            for k in state_dict_padre.keys():
+                state_dict_padre[k] = 0.5 * state_dict_padre[k] + 0.5 * state_dict_hijo[k]
+            model_padre.load_state_dict(state_dict_padre)
+
+        print(f"[Padre {os.getpid()}] Promedio completado.")
+        os.close(r2_fd)
+
+        os.wait()
+        print(f"[Padre {os.getpid()}] Hijo terminado.")
+
+        # === Generar texto final con pesos promedio ===
+        vocab = {w: i for i, w in idx_to_word.items()}  # reconstruir vocab para generación
+        generated_text = generate_text(model_padre, idx_to_word, vocab, max_tokens=10)
+        print(f"\n✅ Texto generado con pesos promedio:\n{generated_text}")
+
+
     
-    for _ in range(5):
-        logits = model(generated)
-        probs = F.softmax(logits[:, -1, :], dim=-1)
-        next_token = torch.multinomial(probs, num_samples=1)
-        print("Next token",next_token)
-        generated = torch.cat([generated, next_token], dim=1)
-    idx_to_word = {i: w for w, i in vocab.items()}
-    print("Generated:", ' '.join(idx_to_word[i.item()] for i in generated[0]))
 
     
